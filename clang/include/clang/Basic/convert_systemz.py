@@ -2,13 +2,15 @@
 
 import re
 import sys
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+from collections import OrderedDict
+
 
 class SystemZConverter:
     def __init__(self):
         self.base_types = {
             'v': 'void',
-            'b': 'bool', 
+            'b': 'bool',
             'c': 'char',
             's': 'short',
             'i': 'int',
@@ -30,10 +32,10 @@ class SystemZConverter:
             'J': 'jmp_buf',
             'p': 'pid_t',
         }
-        
+       
         self.attributes = {
             'n': 'NoThrow',
-            'r': 'NoReturn', 
+            'r': 'NoReturn',
             'U': 'Pure',
             'c': 'Const',
             't': 'CustomTypeChecking',
@@ -51,6 +53,7 @@ class SystemZConverter:
             'G': 'CXXConsteval',
         }
 
+
     def parse_builtin_line(self, line: str) -> Optional[Tuple[str, str, str, str]]:
         pattern = r'TARGET_BUILTIN\(([^,]+),\s*"([^"]*)",\s*"([^"]*)",\s*"([^"]*)"\)'
         match = re.match(pattern, line.strip())
@@ -58,14 +61,15 @@ class SystemZConverter:
             return match.group(1), match.group(2), match.group(3), match.group(4)
         return None
 
+
     def parse_type_encoding(self, encoding: str) -> Tuple[str, List[str]]:
         if not encoding:
             return "void", []
-        
+       
         i = 0
         return_type = self._parse_single_type(encoding, i)
         i = return_type[1]
-        
+       
         params = []
         while i < len(encoding):
             if encoding[i] == '.':
@@ -74,14 +78,14 @@ class SystemZConverter:
             param_type = self._parse_single_type(encoding, i)
             params.append(param_type[0])
             i = param_type[1]
-        
+       
         return return_type[0], params
+
 
     def _parse_single_type(self, encoding: str, start_pos: int) -> Tuple[str, int]:
         i = start_pos
         if i >= len(encoding):
             return "void", i
-
 
         prefixes = []
         while i < len(encoding):
@@ -100,10 +104,8 @@ class SystemZConverter:
             else:
                 break
 
-
         if i >= len(encoding):
             return "void", i
-
 
         base_type = ""
         if encoding[i] == 'V':
@@ -151,7 +153,6 @@ class SystemZConverter:
             base_type = self.base_types.get(encoding[i], f"UnknownType_{encoding[i]}")
             i += 1
 
-
         cv = []
         ptrs = []
         while i < len(encoding):
@@ -173,11 +174,9 @@ class SystemZConverter:
             else:
                 break
 
-
         prefix_str = (" ".join(prefixes) + " ") if prefixes else ""
         cv_str = (" " + " ".join(cv)) if cv else ""
         ptr_str = "".join((" *" if p == "*" else " &") for p in ptrs)
-
 
         full_type = f"{prefix_str}{base_type}{cv_str}{ptr_str}"
         return full_type.strip(), i
@@ -209,14 +208,22 @@ class SystemZConverter:
             i += 1
         return attrs
 
-    def generate_tablegen_def(self, name: str, return_type: str, param_types: List[str], 
-                            attributes: List[str], feature: str) -> str:
-        def_name = name.replace('__builtin_s390_', '').replace('__builtin_', '')
-        def_name = ''.join(word.capitalize() for word in def_name.split('_'))
+
+    def generate_compact_def(self, name: str, return_type: str, param_types: List[str],
+                             attributes: List[str]) -> str:
+        """Generate compact TableGen definition using base classes"""
         
-        if def_name.startswith('390'):
-            def_name = 'S' + def_name
+        # Determine which base class to use and the def name
+        if '__builtin_s390_' in name:
+            # Remove the __builtin_s390_ prefix for the def name
+            def_name = name.replace('__builtin_s390_', '')
+            base_class = 'SystemZBuiltin'
+        else:
+            # Keep the full name for non-s390 builtins
+            def_name = name
+            base_class = 'SystemZNoPrefixBuiltin'
         
+        # Build prototype
         if not param_types:
             prototype = f"{return_type}()"
         elif param_types == ["..."]:
@@ -224,28 +231,28 @@ class SystemZConverter:
         else:
             prototype = f"{return_type}({', '.join(param_types)})"
         
-        result = f"""def {def_name} : TargetBuiltin {{
-  let Spellings = ["{name}"];
-  let Prototype = "{prototype}";"""
-        
+        # Build attributes list
         if attributes:
-            attr_str = ', '.join(attributes)
-            result += f"\n  let Attributes = [{attr_str}];"
+            attr_str = f", [{', '.join(attributes)}]"
+        else:
+            attr_str = ""
         
-        if feature:
-            result += f'\n  let Features = "{feature.strip()}";'
-        
-        result += "\n}"
-        
-        return result
+        # Generate compact definition
+        return f'def {def_name} : {base_class}<"{prototype}"{attr_str}>;'
 
-    def convert_builtin(self, name: str, proto_encoding: str, attr_encoding: str, feature: str) -> str:
-        try:
-            return_type, param_types = self.parse_type_encoding(proto_encoding)
-            attributes = self.decode_attributes(attr_encoding)
-            return self.generate_tablegen_def(name, return_type, param_types, attributes, feature)
-        except Exception as e:
-            return f"// ERROR converting {name}: {e}\n// Original: TARGET_BUILTIN({name}, \"{proto_encoding}\", \"{attr_encoding}\", \"{feature}\")"
+
+    def group_builtins_by_feature(self, builtins_data: List[Tuple]) -> Dict[str, List]:
+        """Group builtins by their feature attribute"""
+        groups = OrderedDict()
+        
+        for name, proto_encoding, attr_encoding, feature in builtins_data:
+            feature = feature.strip()
+            if feature not in groups:
+                groups[feature] = []
+            groups[feature].append((name, proto_encoding, attr_encoding))
+        
+        return groups
+
 
     def convert_file(self, input_file: str, output_file: str = None):
         try:
@@ -255,7 +262,22 @@ class SystemZConverter:
             print(f"Error: File not found {input_file}")
             return
         
+        # Parse all builtins first
+        builtins_data = []
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if line.startswith('TARGET_BUILTIN'):
+                parsed = self.parse_builtin_line(line)
+                if parsed:
+                    builtins_data.append(parsed)
+        
+        # Group by feature
+        feature_groups = self.group_builtins_by_feature(builtins_data)
+        
+        # Generate output
         converted_lines = []
+        
+        # Header
         converted_lines.append("//===--- BuiltinsSystemZ.td - SystemZ Builtin function database -*- C++ -*-===//")
         converted_lines.append("//")
         converted_lines.append("// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.")
@@ -267,27 +289,50 @@ class SystemZConverter:
         converted_lines.append('include "clang/Basic/BuiltinsBase.td"')
         converted_lines.append("")
         
+        # Add base class definitions
+        converted_lines.append('def SystemZPrefix : NamePrefix<"__builtin_s390_">;')
+        converted_lines.append("")
+        converted_lines.append("class SystemZBuiltin<string prototype, list<Attribute> Attr = []> : TargetBuiltin {")
+        converted_lines.append("  let Spellings = [NAME];")
+        converted_lines.append("  let Prototype = prototype;")
+        converted_lines.append("  let Attributes = Attr;")
+        converted_lines.append("  let RequiredNamePrefix = SystemZPrefix;")
+        converted_lines.append("}")
+        converted_lines.append("")
+        converted_lines.append("class SystemZNoPrefixBuiltin<string prototype, list<Attribute> Attr = []> : TargetBuiltin {")
+        converted_lines.append("  let Spellings = [NAME];")
+        converted_lines.append("  let Prototype = prototype;")
+        converted_lines.append("  let Attributes = Attr;")
+        converted_lines.append("}")
+        converted_lines.append("")
+        
+        # Generate grouped definitions
         conversion_count = 0
         error_count = 0
         
-        for line_num, line in enumerate(lines, 1):
-            line = line.strip()
-            if line.startswith('TARGET_BUILTIN'):
-                parsed = self.parse_builtin_line(line)
-                if parsed:
-                    name, proto, attrs, feature = parsed
-                    converted = self.convert_builtin(name, proto, attrs, feature)
-                    converted_lines.append(converted)
-                    converted_lines.append("")
+        for feature, builtins in feature_groups.items():
+            # Start feature group
+            converted_lines.append(f'let Features = "{feature}" in {{')
+            
+            for name, proto_encoding, attr_encoding in builtins:
+                try:
+                    return_type, param_types = self.parse_type_encoding(proto_encoding)
+                    attributes = self.decode_attributes(attr_encoding)
                     
-                    if converted.startswith("// ERROR"):
-                        error_count += 1
-                    else:
-                        conversion_count += 1
-                else:
-                    converted_lines.append(f"// ERROR: Could not parse line {line_num}: {line}")
+                    compact_def = self.generate_compact_def(name, return_type, param_types, attributes)
+                    converted_lines.append(f"  {compact_def}")
+                    conversion_count += 1
+                    
+                except Exception as e:
+                    error_line = f"  // ERROR converting {name}: {e}"
+                    converted_lines.append(error_line)
                     error_count += 1
+            
+            # End feature group
+            converted_lines.append("}")
+            converted_lines.append("")
         
+        # Write output
         output_content = '\n'.join(converted_lines)
         if output_file:
             with open(output_file, 'w') as f:
@@ -295,47 +340,49 @@ class SystemZConverter:
             print(f"Conversion completed!")
             print(f"Output file: {output_file}")
             print(f"Successfully converted: {conversion_count} functions")
+            print(f"Feature groups: {len(feature_groups)}")
             if error_count > 0:
                 print(f"Conversion errors: {error_count}")
         else:
             print(output_content)
 
+
     def test_conversion(self):
         test_cases = [
-            ('TARGET_BUILTIN(__builtin_tbegin, "iv*", "j", "transactional-execution")', 
-             "Simple pointer type"),
-            ('TARGET_BUILTIN(__builtin_s390_lcbb, "UivC*Ii", "nc", "vector")', 
-             "Complex mixed types"),
-            ('TARGET_BUILTIN(__builtin_s390_vperm, "V16UcV16UcV16UcV16Uc", "nc", "vector")', 
+            ('TARGET_BUILTIN(__builtin_tbegin, "iv*", "j", "transactional-execution")',
+             "Transaction builtin (no s390 prefix)"),
+            ('TARGET_BUILTIN(__builtin_s390_lcbb, "UivC*Ii", "nc", "vector")',
+             "Vector builtin (with s390 prefix)"),
+            ('TARGET_BUILTIN(__builtin_s390_vperm, "V16UcV16UcV16UcV16Uc", "nc", "vector")',
              "Vector types"),
-            ('TARGET_BUILTIN(__builtin_s390_vfidb, "V2dV2dIiIi", "nc", "vector")', 
-             "Multi-param vectors"),
         ]
-        
-        print("=== Testing Conversion ===\n")
+       
+        print("=== Testing Compact Conversion ===\n")
         for test_case, description in test_cases:
             print(f"Test: {description}")
             print(f"Input: {test_case}")
-            
+           
             parsed = self.parse_builtin_line(test_case)
             if parsed:
                 name, proto, attrs, feature = parsed
                 print(f"Parsed:")
                 print(f"  Name: {name}")
-                print(f"  Prototype: {proto}")
-                print(f"  Attributes: {attrs}")
                 print(f"  Feature: {feature}")
+               
+                return_type, param_types = self.parse_type_encoding(proto)
+                attributes = self.decode_attributes(attrs)
                 
-                converted = self.convert_builtin(name, proto, attrs, feature)
+                compact_def = self.generate_compact_def(name, return_type, param_types, attributes)
                 print(f"Result:")
-                print(converted)
+                print(f"  {compact_def}")
             else:
                 print("Parse failed!")
             print("-" * 60)
 
+
 def main():
     converter = SystemZConverter()
-    
+   
     if len(sys.argv) > 1:
         if sys.argv[1] == '--test':
             converter.test_conversion()
@@ -344,7 +391,7 @@ def main():
             output_file = sys.argv[2] if len(sys.argv) > 2 else 'BuiltinsSystemZ.td'
             converter.convert_file(input_file, output_file)
     else:
-        print("SystemZ Builtin Function Converter")
+        print("SystemZ Builtin Function Converter (Compact Version)")
         print("Usage:")
         print("  python convert_systemz.py --test                    # Run tests")
         print("  python convert_systemz.py input.def [output.td]     # Convert file")
@@ -352,6 +399,6 @@ def main():
         print("Example:")
         print("  python convert_systemz.py BuiltinsSystemZ.def BuiltinsSystemZ.td")
 
+
 if __name__ == "__main__":
     main()
-
