@@ -86,33 +86,79 @@ class SystemZConverter:
         i = start_pos
         if i >= len(encoding):
             return "void", i
-
+    
         prefixes = []
+        is_int128 = False
+    
         while i < len(encoding):
             if encoding[i:i+3] == 'LLL':
-                prefixes.append('long long'); i += 3
+                is_int128 = True
+                i += 3
+                continue
             elif encoding[i:i+2] == 'LL':
-                prefixes.append('long long'); i += 2
+                prefixes.append('long long')
+                i += 2
             elif encoding[i] == 'L':
-                prefixes.append('long'); i += 1
+                prefixes.append('long')
+                i += 1
             elif encoding[i] == 'U':
-                prefixes.append('unsigned'); i += 1
+                prefixes.append('unsigned')
+                i += 1
             elif encoding[i] == 'S':
-                prefixes.append('signed'); i += 1
+                prefixes.append('signed')
+                i += 1
             elif encoding[i] in 'ZWNOI':
                 i += 1
             else:
                 break
-
+    
         if i >= len(encoding):
             return "void", i
+    
+        if is_int128:
+            base_type = "__int128_t"
+            prefixes = [p for p in prefixes if p != 'unsigned']
 
+            if i < len(encoding):
+                i += 1
+    
+            cv = []
+            ptrs = []
+            while i < len(encoding):
+                ch = encoding[i]
+                if ch == '*':
+                    ptrs.append('*')
+                    i += 1
+                    if i < len(encoding) and encoding[i].isdigit():
+                        i += 1
+                elif ch == '&':
+                    ptrs.append('&')
+                    i += 1
+                    if i < len(encoding) and encoding[i].isdigit():
+                        i += 1
+                elif ch == 'C':
+                    cv.append('const')
+                    i += 1
+                elif ch == 'D':
+                    cv.append('volatile')
+                    i += 1
+                elif ch == 'R':
+                    cv.append('restrict')
+                    i += 1
+                else:
+                    break
+    
+            cv_str = (" " + " ".join(cv)) if cv else ""
+            ptr_str = "".join((" *" if p == "*" else " &") for p in ptrs)
+            return f"{base_type}{cv_str}{ptr_str}".strip(), i
+    
         base_type = ""
         if encoding[i] == 'V':
             i += 1
             num_str = ""
             while i < len(encoding) and encoding[i].isdigit():
-                num_str += encoding[i]; i += 1
+                num_str += encoding[i]
+                i += 1
             elem_type, i2 = self._parse_single_type(encoding, i)
             base_type = f"_Vector<{num_str}, {elem_type}>"
             i = i2
@@ -120,7 +166,8 @@ class SystemZConverter:
             i += 1
             num_str = ""
             while i < len(encoding) and encoding[i].isdigit():
-                num_str += encoding[i]; i += 1
+                num_str += encoding[i]
+                i += 1
             elem_type, i2 = self._parse_single_type(encoding, i)
             base_type = f"ScalableVector<{num_str}, {elem_type}>"
             i = i2
@@ -128,7 +175,8 @@ class SystemZConverter:
             i += 1
             num_str = ""
             while i < len(encoding) and encoding[i].isdigit():
-                num_str += encoding[i]; i += 1
+                num_str += encoding[i]
+                i += 1
             elem_type, i2 = self._parse_single_type(encoding, i)
             base_type = f"_Vector<{num_str}, {elem_type}>"
             i = i2
@@ -152,34 +200,37 @@ class SystemZConverter:
         else:
             base_type = self.base_types.get(encoding[i], f"UnknownType_{encoding[i]}")
             i += 1
-
+    
         cv = []
         ptrs = []
         while i < len(encoding):
             ch = encoding[i]
             if ch == '*':
-                ptrs.append('*'); i += 1
+                ptrs.append('*')
+                i += 1
                 if i < len(encoding) and encoding[i].isdigit():
                     i += 1
             elif ch == '&':
-                ptrs.append('&'); i += 1
+                ptrs.append('&')
+                i += 1
                 if i < len(encoding) and encoding[i].isdigit():
                     i += 1
             elif ch == 'C':
-                cv.append('const'); i += 1
+                cv.append('const')
+                i += 1
             elif ch == 'D':
-                cv.append('volatile'); i += 1
+                cv.append('volatile')
+                i += 1
             elif ch == 'R':
-                cv.append('restrict'); i += 1
+                cv.append('restrict')
+                i += 1
             else:
                 break
-
+    
         prefix_str = (" ".join(prefixes) + " ") if prefixes else ""
         cv_str = (" " + " ".join(cv)) if cv else ""
         ptr_str = "".join((" *" if p == "*" else " &") for p in ptrs)
-
-        full_type = f"{prefix_str}{base_type}{cv_str}{ptr_str}"
-        return full_type.strip(), i
+        return f"{prefix_str}{base_type}{cv_str}{ptr_str}".strip(), i
 
 
     def decode_attributes(self, attr_str: str) -> List[str]:
